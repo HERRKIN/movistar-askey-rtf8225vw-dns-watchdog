@@ -12,14 +12,18 @@ import (
 type Notifier struct {
 	BaseURL string
 	Topic   string
+	Token   string
 	Client  *http.Client
 }
 
-// New creates a Notifier for the given ntfy server base URL and topic.
-func New(baseURL, topic string) *Notifier {
+// New creates a Notifier for the given ntfy server base URL and topic. token
+// is optional; when non-empty it is sent as a Bearer access token (required
+// by ntfy servers that gate publishing behind authentication).
+func New(baseURL, topic, token string) *Notifier {
 	return &Notifier{
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		Topic:   topic,
+		Token:   token,
 		Client:  &http.Client{Timeout: 10 * time.Second},
 	}
 }
@@ -37,6 +41,9 @@ func (n *Notifier) Send(title, body string) error {
 		return fmt.Errorf("notify: failed to build request: %w", err)
 	}
 	req.Header.Set("Title", title)
+	if n.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+n.Token)
+	}
 
 	resp, err := n.Client.Do(req)
 	if err != nil {

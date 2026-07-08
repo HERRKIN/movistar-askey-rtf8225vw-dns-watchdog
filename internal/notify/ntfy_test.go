@@ -20,7 +20,7 @@ func TestNotifier_Send(t *testing.T) {
 	}))
 	defer server.Close()
 
-	n := New(server.URL, "dns-watchdog")
+	n := New(server.URL, "dns-watchdog", "")
 	if err := n.Send("DNS drift detected", "restored to 192.168.1.254"); err != nil {
 		t.Fatalf("Send() unexpected error: %v", err)
 	}
@@ -45,15 +45,32 @@ func TestNotifier_Send_ErrorStatus(t *testing.T) {
 	}))
 	defer server.Close()
 
-	n := New(server.URL, "dns-watchdog")
+	n := New(server.URL, "dns-watchdog", "")
 	if err := n.Send("title", "body"); err == nil {
 		t.Fatal("Send() expected error on non-2xx status, got nil")
 	}
 }
 
 func TestNew_TrimsTrailingSlash(t *testing.T) {
-	n := New("https://ntfy.example.com/", "topic")
+	n := New("https://ntfy.example.com/", "topic", "")
 	if n.BaseURL != "https://ntfy.example.com" {
 		t.Errorf("BaseURL = %q, want %q", n.BaseURL, "https://ntfy.example.com")
+	}
+}
+
+func TestNotifier_Send_BearerToken(t *testing.T) {
+	var gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	n := New(server.URL, "dns-watchdog", "tk_test123")
+	if err := n.Send("t", "b"); err != nil {
+		t.Fatalf("Send() unexpected error: %v", err)
+	}
+	if gotAuth != "Bearer tk_test123" {
+		t.Errorf("Authorization = %q, want %q", gotAuth, "Bearer tk_test123")
 	}
 }

@@ -19,7 +19,10 @@ import (
 // It reads ".env" (standard) and "watchdog.secrets" (an alternate name used
 // for local testing in environments where .env access is restricted).
 func loadDotEnv() {
-	for _, name := range []string{".env", "watchdog.secrets"} {
+	// watchdog.secrets is read first so it takes precedence over any stale
+	// .env (e.g. one created from env.example with placeholder values).
+	// Real process environment variables still win over both.
+	for _, name := range []string{"watchdog.secrets", ".env"} {
 		loadEnvFile(name)
 	}
 }
@@ -66,6 +69,9 @@ type Config struct {
 	NtfyURL string
 	// NtfyTopic is the ntfy topic to publish notifications to.
 	NtfyTopic string
+	// NtfyToken is an optional ntfy access token sent as a Bearer token, for
+	// servers that require authentication to publish. Empty = anonymous.
+	NtfyToken string
 	// EventLogPath is the path to the append-only JSONL event log.
 	EventLogPath string
 	// Iface is the network interface to use for the DHCP probe. Optional —
@@ -96,6 +102,7 @@ func Load() (Config, error) {
 		DesiredDNS:     os.Getenv("DESIRED_DNS"),
 		NtfyURL:        os.Getenv("NTFY_URL"),
 		NtfyTopic:      getEnv("NTFY_TOPIC", defaultNtfyTopic),
+		NtfyToken:      os.Getenv("NTFY_TOKEN"),
 		EventLogPath:   getEnv("EVENT_LOG_PATH", defaultEventLogPath),
 		Iface:          os.Getenv("IFACE"),
 	}

@@ -26,11 +26,14 @@
 // frame targets are resolved by URL/title and this frameset's child frames
 // are same-origin but otherwise unremarkable.
 //
-// Safety: dryRun reads and logs the current DNS values and what WOULD be
-// set, and returns WITHOUT changing anything on the router — no login-page
-// bypass, no button click on the LAN page. This is the intended way to
-// verify the flow (does it reach the LAN page? are the field names right?)
-// before ever setting DRY_RUN=false.
+// Safety: Restore only ever writes when the current DNS configuration has
+// actually drifted from the desired value — a no-drift call is a read-only
+// no-op regardless of dryRun. On top of that, dryRun reads and logs the
+// current DNS values and what WOULD be set on drift, and returns WITHOUT
+// changing anything on the router — no login-page bypass, no button click on
+// the LAN page. This is the intended way to verify the flow (does it reach
+// the LAN page? are the field names right?) before ever setting
+// DRY_RUN=false.
 //
 // See newBrowserContext (browser.go) for how the browser process itself is
 // launched, including the CHROME_PATH and HEADFUL env overrides.
@@ -66,17 +69,43 @@ const postActionSettle = 3 * time.Second
 // before the LAN page's frames are queried.
 const postNavigateSettle = 2 * time.Second
 
-// Restore logs into the router via a real browser and updates the LAN DNS
-// configuration to desiredDNS.
+// RestoreResult reports what Restore observed and did on the router's LAN
+// page.
+type RestoreResult struct {
+	// Authenticated reports whether the browser login succeeded and reached
+	// the LAN page. When false, DNSServer1/DNSServer2/Drifted/Applied are
+	// zero values and Restore also returns a non-nil error.
+	Authenticated bool
+	// DNSServer1 and DNSServer2 are the DNS values currently configured on
+	// the router's LAN page, as read BEFORE any write.
+	DNSServer1 string
+	DNSServer2 string
+	// Drifted is true when the current DNS configuration (either field)
+	// differs from desiredDNS.
+	Drifted bool
+	// Applied is true only when Restore actually wrote desiredDNS to the
+	// router and clicked "Aplicar cambios". It is always false when Drifted
+	// is false (nothing to do) and always false when dryRun is true (even
+	// if drifted).
+	Applied bool
+}
+
+// Restore logs into the router via a real browser, reads the current LAN DNS
+// configuration, and — ONLY if it has actually drifted from desiredDNS —
+// updates it.
+//
+// Restore never writes when the current configuration already matches
+// desiredDNS: this keeps repeated calls (e.g. from a polling loop) idempotent
+// and avoids needless router writes.
 //
 // When dryRun is true, Restore performs every step through reading the
-// current DNS values on the LAN page, logs them along with what WOULD be
-// set, and returns nil WITHOUT touching the DNSserver1/DNSserver2 fields or
+// current DNS values on the LAN page, logs what WOULD be set if drift is
+// detected, and returns WITHOUT touching the DNSserver1/DNSserver2 fields or
 // clicking "Aplicar cambios". This is the intended way to verify the flow
 // against the real router before ever setting dryRun to false.
 //
 // logger may be nil, in which case log.Default() is used.
-func Restore(logger *log.Logger, routerURL string, creds Credentials, desiredDNS string, dryRun bool) error {
+func Restore(logger *log.Logger, routerURL string, creds Credentials, desiredDNS string, dryRun bool) (RestoreResult, error) {
 	if logger == nil {
 		logger = log.Default()
 	}
@@ -89,38 +118,51 @@ func Restore(logger *log.Logger, routerURL string, creds Credentials, desiredDNS
 	defer cancelTimeout()
 
 	if err := chromedp.Run(ctx, chromedp.Navigate(routerURL+"/")); err != nil {
-		return fmt.Errorf("remediator: failed to navigate to router: %w", err)
+		return RestoreResult{}, fmt.Errorf("remediator: failed to navigate to router: %w", err)
 	}
 	if debug {
 		logger.Printf("DEBUG_LOGIN: navigated to %s/", routerURL)
 	}
 
 	if err := loginViaBrowser(ctx, routerURL, creds.Password, debug, logger); err != nil {
-		return err
+		return RestoreResult{}, err
 	}
 
 	lan, err := readLANPage(ctx, routerURL, debug, logger)
 	if err != nil {
-		return err
+		return RestoreResult{}, err
 	}
 	if !lan.Authenticated {
-		return fmt.Errorf("remediator: browser login did not reach the LAN page")
+		return RestoreResult{}, fmt.Errorf("remediator: browser login did not reach the LAN page")
 	}
 
 	logger.Printf("current DNS: DNSserver1=%s DNSserver2=%s", lan.DNSServer1, lan.DNSServer2)
 
+	result := RestoreResult{
+		Authenticated: true,
+		DNSServer1:    lan.DNSServer1,
+		DNSServer2:    lan.DNSServer2,
+		Drifted:       lan.DNSServer1 != desiredDNS || lan.DNSServer2 != desiredDNS,
+	}
+
+	if !result.Drifted {
+		logger.Printf("DNS already correct (%s) — nothing to do", desiredDNS)
+		return result, nil
+	}
+
 	if dryRun {
-		logger.Printf("DRY_RUN: would set DNSserver1=%s DNSserver2=%s (currently DNSserver1=%s DNSserver2=%s)",
-			desiredDNS, desiredDNS, lan.DNSServer1, lan.DNSServer2)
-		return nil
+		logger.Printf("DRY_RUN: drift detected (current %s/%s) — would set %s",
+			lan.DNSServer1, lan.DNSServer2, desiredDNS)
+		return result, nil
 	}
 
 	if err := applyDNS(ctx, desiredDNS, debug, logger); err != nil {
-		return err
+		return result, err
 	}
 
 	logger.Printf("DNS updated: DNSserver1=%s DNSserver2=%s (apply clicked)", desiredDNS, desiredDNS)
-	return nil
+	result.Applied = true
+	return result, nil
 }
 
 // loginViaBrowser sets the password in the login frame and clicks the submit

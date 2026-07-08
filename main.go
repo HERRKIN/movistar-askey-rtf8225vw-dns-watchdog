@@ -6,6 +6,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -35,7 +36,7 @@ func main() {
 		}
 	}
 
-	notifier := notify.New(cfg.NtfyURL, cfg.NtfyTopic)
+	notifier := notify.New(cfg.NtfyURL, cfg.NtfyTopic, cfg.NtfyToken)
 	events := eventlog.New(cfg.EventLogPath)
 
 	logger.Printf("starting watchdog: iface=%s desired_dns=%s interval=%s router=%s dry_run=%v",
@@ -97,7 +98,7 @@ func runCheck(logger *log.Logger, cfg config.Config, iface string, notifier *not
 		logger.Printf("failed to write event log: %v", err)
 	}
 
-	restoreErr := remediator.Restore(logger, cfg.RouterURL, remediator.Credentials{Password: cfg.RouterPassword}, cfg.DesiredDNS, cfg.DryRun)
+	res, restoreErr := remediator.Restore(logger, cfg.RouterURL, remediator.Credentials{Password: cfg.RouterPassword}, cfg.DesiredDNS, cfg.DryRun)
 
 	restoreEvent := eventlog.Event{
 		Type:        eventlog.EventRestore,
@@ -107,18 +108,29 @@ func runCheck(logger *log.Logger, cfg config.Config, iface string, notifier *not
 	notifyTitle := "DNS drift restored"
 	notifyBody := "Advertised DNS drifted from " + cfg.DesiredDNS + " and was restored."
 
-	if cfg.DryRun {
-		notifyTitle = "DNS drift detected (DRY_RUN — not restored)"
-		notifyBody = "Advertised DNS drifted from " + cfg.DesiredDNS + ". DRY_RUN is enabled: the fix was NOT applied. See logs for the constructed save request."
-		restoreEvent.Detail = "dry_run: fix not applied"
-	}
-
-	if restoreErr != nil {
+	switch {
+	case restoreErr != nil:
 		logger.Printf("remediation failed: %v", restoreErr)
 		restoreEvent.Type = eventlog.EventError
 		restoreEvent.Detail = restoreErr.Error()
 		notifyTitle = "DNS drift detected — remediation FAILED"
 		notifyBody = "Advertised DNS drifted from " + cfg.DesiredDNS + " and automatic remediation failed: " + restoreErr.Error()
+	case !res.Drifted:
+		// The DHCP-advertised value drifted, but the router's own LAN page
+		// already shows the desired DNS (e.g. the router already
+		// self-corrected, or DHCP lease info was briefly stale). Nothing was
+		// written.
+		logger.Printf("router DNS already correct (%s) — no write performed", cfg.DesiredDNS)
+		restoreEvent.Type = eventlog.EventOK
+		restoreEvent.Detail = "router LAN page already matched desired DNS; no write performed"
+	case res.Applied:
+		logger.Printf("DNS restored: DNSserver1=%s DNSserver2=%s -> %s", res.DNSServer1, res.DNSServer2, cfg.DesiredDNS)
+		restoreEvent.Detail = fmt.Sprintf("restored from %s/%s to %s", res.DNSServer1, res.DNSServer2, cfg.DesiredDNS)
+	default:
+		// Drifted but not applied: dry-run mode.
+		notifyTitle = "DNS drift detected (DRY_RUN — not restored)"
+		notifyBody = "Advertised DNS drifted from " + cfg.DesiredDNS + ". DRY_RUN is enabled: the fix was NOT applied. See logs for the constructed save request."
+		restoreEvent.Detail = "dry_run: fix not applied"
 	}
 
 	if err := events.Append(restoreEvent); err != nil {

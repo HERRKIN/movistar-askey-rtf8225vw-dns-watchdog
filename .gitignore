@@ -26,3 +26,8 @@ openspec/
 nightwatch.bin
 nightwatch.log
 nightwatch.sh
+
+# Day watchdog artifacts
+daywatch.bin
+daywatch.log
+events.jsonl

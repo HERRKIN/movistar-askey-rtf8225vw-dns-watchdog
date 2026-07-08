@@ -58,15 +58,18 @@ func main() {
 			cfg.RouterURL, cfg.DesiredDNS)
 	}
 
-	if err := remediator.Restore(
+	res, err := remediator.Restore(
 		logger,
 		cfg.RouterURL,
 		remediator.Credentials{Password: cfg.RouterPassword},
 		cfg.DesiredDNS,
 		dryRun,
-	); err != nil {
+	)
+	if err != nil {
 		logger.Fatalf("restore failed: %v", err)
 	}
 
+	logger.Printf("current DNS: DNSserver1=%s DNSserver2=%s drifted=%v applied=%v",
+		res.DNSServer1, res.DNSServer2, res.Drifted, res.Applied)
 	logger.Printf("verify completed")
 }
