@@ -1,154 +1,205 @@
-// Package remediator restores the router's LAN DNS configuration via the
-// router's plain-HTTP admin CGI endpoints (no browser required).
+// Package remediator restores the router's LAN DNS configuration by driving
+// a real Chrome/Chromium browser via chromedp.
 //
-// Flow (confirmed against the router's own JS/HTML — see engram topics
-// dns-modem-watchdog/http-remediation and dns-modem-watchdog/login-spec):
+// Why a real browser (and not raw HTTP): this was tried exhaustively first
+// (plaintext POST login, cookie jar, browser-like headers, exact form
+// fields observed in the router's JS) and it never authenticates — GET
+// /te_red_local.asp after the POST still returns the login page. Replaying
+// the same request as an XHR from inside a real browser also fails
+// identically. Only a genuine top-level browser navigation + native form
+// submit (a real .click() on the login button) authenticates against this
+// router. See engram topic dns-modem-watchdog/remediation-approach for the
+// full investigation.
 //
-//  1. POST /cgi-bin/te_acceso_router.cgi to log in (plaintext password,
-//     fixed username "user"). The response sets a session cookie.
-//     (session.go)
-//  2. GET /te_red_local.asp (with the session cookie) to scrape a fresh
-//     sessionKey and read the CURRENT LAN configuration. (session.go,
-//     saveurl.go, lanfields.go)
-//  3. GET /cgi-bin/te_red_local.cgi (with the session cookie) with every
-//     current LAN field preserved except the DNS, plus the sessionKey.
-//     (saveurl.go, lanfields.go)
-//  4. GET /cgi-bin/te_logout.cgi to close the session (best-effort).
-//     (remediator.go)
+// Flow (confirmed manually against the real router):
 //
-// This package uses only net/http + net/http/cookiejar (both stdlib), so it
-// builds and runs identically on macOS and Linux — unlike the DHCP probe in
-// internal/detector, which is Linux-only. That means the whole HTTP
-// remediation path can be exercised against a fake HTTP server on a Mac.
+//  1. Navigate to routerURL ("/"). The admin UI is a FRAMESET.
+//  2. In the login child frame, set input[name=Password] and click the
+//     submit button (value "Entrar"). The native submit authenticates.
+//  3. Navigate to routerURL + "/te_red_local.asp". In the LAN child frame,
+//     read (and, unless dryRun, set) input[name=DNSserver1] /
+//     input[name=DNSserver2], then click "Aplicar cambios" to save.
 //
-// Safety: Restore has a DRY_RUN mode (see the dryRun parameter) that
-// performs every step up to and including building the save URL, logs it
-// (with sessionKey and any password redacted), and returns WITHOUT ever
-// sending the request that would actually change the router's config. This
-// is the intended way to verify the constructed request against the real
-// router before ever flipping DRY_RUN off.
+// All element access happens via chromedp.Evaluate running JS that walks
+// window.frames itself (see script.go) — chromedp's selector-based actions
+// cannot reliably target elements inside child frames on this router, since
+// frame targets are resolved by URL/title and this frameset's child frames
+// are same-origin but otherwise unremarkable.
 //
-// Open assumptions that still need live verification against the real
-// router — see doc comments on encodeLanHostDns (saveurl.go) and
-// buildLANFieldsForRestore (lanfields.go), and the engram apply-progress
-// entry for this change.
+// Safety: dryRun reads and logs the current DNS values and what WOULD be
+// set, and returns WITHOUT changing anything on the router — no login-page
+// bypass, no button click on the LAN page. This is the intended way to
+// verify the flow (does it reach the LAN page? are the field names right?)
+// before ever setting DRY_RUN=false.
 //
-// File layout (single package, split by responsibility):
-//   - remediator.go — this file: shared endpoints/consts, Credentials,
-//     Restore (top-level orchestration), logout.
-//   - session.go — Login and fetchLANPage (HTTP session concerns).
-//   - saveurl.go — LANFields, BuildSaveURL, encodeLanHostDns,
-//     ScrapeSessionKey, redactURL (save-request construction + logging
-//     safety).
-//   - lanfields.go — LANPageFields, ParseLANFields, buildLANFieldsForRestore
-//     (reading and preserving the router's current LAN config).
+// See newBrowserContext (browser.go) for how the browser process itself is
+// launched, including the CHROME_PATH and HEADFUL env overrides.
 package remediator
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"time"
-)
 
-// Router endpoints and fixed login parameters, per engram topics
-// dns-modem-watchdog/http-remediation and dns-modem-watchdog/login-spec.
-const (
-	loginPath        = "/cgi-bin/te_acceso_router.cgi"
-	lanPagePath      = "/te_red_local.asp"
-	saveEndpointPath = "/cgi-bin/te_red_local.cgi"
-	logoutPath       = "/cgi-bin/te_logout.cgi"
-
-	// fixedLoginUsername is always "user", even though the router's login
-	// UI only prompts for a password.
-	fixedLoginUsername = "user"
-
-	defaultHTTPTimeout = 15 * time.Second
+	"github.com/chromedp/chromedp"
 )
 
 // Credentials holds the router login credentials.
 type Credentials struct {
-	// Password is the router admin password, sent in PLAIN TEXT over LAN
-	// HTTP (confirmed: no md5/sha/base64 hashing on this router). Treat it
-	// as a secret in every other layer (env vars, logs) even though the
-	// wire protocol itself doesn't protect it.
+	// Password is the router admin password. Never logged by this package.
 	Password string
 }
 
-// logout closes the router session, best-effort. Failures are logged but
-// never fail the caller — a lingering session isn't worth failing a
-// successful (or dry-run) restore over.
-func logout(logger *log.Logger, client *http.Client, routerURL string) {
-	resp, err := client.Get(routerURL + logoutPath)
-	if err != nil {
-		logger.Printf("remediator: logout request failed (non-fatal): %v", err)
-		return
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
-}
+// overallTimeout bounds the entire browser flow (launch, login, navigate,
+// read/write DNS fields) so a hung browser or router can't block forever.
+const overallTimeout = 60 * time.Second
 
-// Restore logs into the router, reads its current LAN configuration, and
-// updates only the DNS to desiredDNS — preserving every other LAN field.
+// postActionSettle is how long Restore waits after an action that triggers
+// browser-side navigation or JS handling (login submit, apply click) before
+// reading the result, since these are driven by the page's own JS rather
+// than a request Restore can wait on directly.
+const postActionSettle = 3 * time.Second
+
+// postNavigateSettle is the shorter wait after a plain top-level navigation,
+// before the LAN page's frames are queried.
+const postNavigateSettle = 2 * time.Second
+
+// Restore logs into the router via a real browser and updates the LAN DNS
+// configuration to desiredDNS.
 //
-// When dryRun is true, Restore performs every step through building the
-// save URL, logs it (sessionKey and any password redacted) via logger, and
-// returns nil WITHOUT ever sending the request that would change the
-// router's configuration. This is the intended way to verify the
-// constructed request against the real router before ever setting dryRun
-// to false. When dryRun is false, the save request is actually sent.
-//
-// A best-effort logout is always attempted before returning (whether or not
-// dryRun is set), to avoid leaving a dangling authenticated session.
+// When dryRun is true, Restore performs every step through reading the
+// current DNS values on the LAN page, logs them along with what WOULD be
+// set, and returns nil WITHOUT touching the DNSserver1/DNSserver2 fields or
+// clicking "Aplicar cambios". This is the intended way to verify the flow
+// against the real router before ever setting dryRun to false.
 //
 // logger may be nil, in which case log.Default() is used.
 func Restore(logger *log.Logger, routerURL string, creds Credentials, desiredDNS string, dryRun bool) error {
 	if logger == nil {
 		logger = log.Default()
 	}
+	debug := loginDebug()
 
-	client, err := Login(routerURL, creds)
-	if err != nil {
-		return fmt.Errorf("remediator: restore failed: %w", err)
+	ctx, cancel := newBrowserContext(context.Background())
+	defer cancel()
+
+	ctx, cancelTimeout := context.WithTimeout(ctx, overallTimeout)
+	defer cancelTimeout()
+
+	if err := chromedp.Run(ctx, chromedp.Navigate(routerURL+"/")); err != nil {
+		return fmt.Errorf("remediator: failed to navigate to router: %w", err)
 	}
-	defer logout(logger, client, routerURL)
-
-	html, err := fetchLANPage(client, routerURL)
-	if err != nil {
-		return fmt.Errorf("remediator: restore failed: %w", err)
-	}
-
-	sessionKey, err := ScrapeSessionKey(html)
-	if err != nil {
-		return fmt.Errorf("remediator: restore failed: %w", err)
+	if debug {
+		logger.Printf("DEBUG_LOGIN: navigated to %s/", routerURL)
 	}
 
-	current, err := ParseLANFields(html)
-	if err != nil {
-		return fmt.Errorf("remediator: restore failed: %w", err)
+	if err := loginViaBrowser(ctx, routerURL, creds.Password, debug, logger); err != nil {
+		return err
 	}
 
-	fields := buildLANFieldsForRestore(current, desiredDNS)
-	saveURL := BuildSaveURL(routerURL, fields, sessionKey)
+	lan, err := readLANPage(ctx, routerURL, debug, logger)
+	if err != nil {
+		return err
+	}
+	if !lan.Authenticated {
+		return fmt.Errorf("remediator: browser login did not reach the LAN page")
+	}
+
+	logger.Printf("current DNS: DNSserver1=%s DNSserver2=%s", lan.DNSServer1, lan.DNSServer2)
 
 	if dryRun {
-		logger.Printf("DRY_RUN: would send save request: %s", redactURL(saveURL))
+		logger.Printf("DRY_RUN: would set DNSserver1=%s DNSserver2=%s (currently DNSserver1=%s DNSserver2=%s)",
+			desiredDNS, desiredDNS, lan.DNSServer1, lan.DNSServer2)
 		return nil
 	}
 
-	resp, err := client.Get(saveURL)
-	if err != nil {
-		return fmt.Errorf("remediator: save request failed: %w", err)
-	}
-	defer resp.Body.Close()
-	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-		return fmt.Errorf("remediator: failed to read save response: %w", err)
-	}
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("remediator: save request returned status %d", resp.StatusCode)
+	if err := applyDNS(ctx, desiredDNS, debug, logger); err != nil {
+		return err
 	}
 
-	logger.Printf("save request sent: %s", redactURL(saveURL))
+	logger.Printf("DNS updated: DNSserver1=%s DNSserver2=%s (apply clicked)", desiredDNS, desiredDNS)
 	return nil
 }
+
+// loginViaBrowser sets the password in the login frame and clicks the submit
+// button, then waits for the router's own JS/navigation to settle.
+func loginViaBrowser(ctx context.Context, routerURL, password string, debug bool, logger *log.Logger) error {
+	passwordLiteral, err := jsStringLiteral(password)
+	if err != nil {
+		return fmt.Errorf("remediator: failed to encode password: %w", err)
+	}
+	script := fmt.Sprintf(loginScriptTemplate, passwordLiteral)
+
+	var result string
+	if err := chromedp.Run(ctx, chromedp.Evaluate(script, &result)); err != nil {
+		return fmt.Errorf("remediator: login script failed: %w", err)
+	}
+	if result != "ok" {
+		return fmt.Errorf("remediator: login form not found or not clickable: %s", result)
+	}
+	if debug {
+		logger.Printf("DEBUG_LOGIN: login submit clicked")
+	}
+
+	if err := chromedp.Run(ctx, chromedp.Sleep(postActionSettle)); err != nil {
+		return fmt.Errorf("remediator: post-login settle failed: %w", err)
+	}
+	return nil
+}
+
+// readLANPage navigates to the LAN configuration page and reads the current
+// DNS values via JS (see script.go).
+func readLANPage(ctx context.Context, routerURL string, debug bool, logger *log.Logger) (lanPageValues, error) {
+	lanURL := routerURL + lanPagePath
+	if err := chromedp.Run(ctx, chromedp.Navigate(lanURL)); err != nil {
+		return lanPageValues{}, fmt.Errorf("remediator: failed to navigate to %s: %w", lanPagePath, err)
+	}
+	if err := chromedp.Run(ctx, chromedp.Sleep(postNavigateSettle)); err != nil {
+		return lanPageValues{}, fmt.Errorf("remediator: LAN page settle failed: %w", err)
+	}
+
+	var raw string
+	if err := chromedp.Run(ctx, chromedp.Evaluate(readLANScriptTemplate, &raw)); err != nil {
+		return lanPageValues{}, fmt.Errorf("remediator: LAN page read script failed: %w", err)
+	}
+	if debug {
+		logger.Printf("DEBUG_LOGIN: LAN page values=%s", raw)
+	}
+
+	var lan lanPageValues
+	if err := json.Unmarshal([]byte(raw), &lan); err != nil {
+		return lanPageValues{}, fmt.Errorf("remediator: failed to parse LAN page values: %w", err)
+	}
+	return lan, nil
+}
+
+// applyDNS sets DNSserver1/DNSserver2 to desiredDNS and clicks "Aplicar
+// cambios" to save, then waits for the router to process the save.
+func applyDNS(ctx context.Context, desiredDNS string, debug bool, logger *log.Logger) error {
+	dnsLiteral, err := jsStringLiteral(desiredDNS)
+	if err != nil {
+		return fmt.Errorf("remediator: failed to encode desired DNS: %w", err)
+	}
+	script := fmt.Sprintf(setDNSScriptTemplate, dnsLiteral, dnsLiteral)
+
+	var result string
+	if err := chromedp.Run(ctx, chromedp.Evaluate(script, &result)); err != nil {
+		return fmt.Errorf("remediator: set-DNS script failed: %w", err)
+	}
+	if result != "ok" {
+		return fmt.Errorf("remediator: failed to set/apply DNS fields: %s", result)
+	}
+	if debug {
+		logger.Printf("DEBUG_LOGIN: apply cambios clicked")
+	}
+
+	if err := chromedp.Run(ctx, chromedp.Sleep(postActionSettle)); err != nil {
+		return fmt.Errorf("remediator: post-apply settle failed: %w", err)
+	}
+	return nil
+}
+
+// lanPagePath is the router's LAN configuration page.
+const lanPagePath = "/te_red_local.asp"

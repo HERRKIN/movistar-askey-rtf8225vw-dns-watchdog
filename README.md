@@ -14,57 +14,57 @@ happens), and notifies via [ntfy](https://ntfy.sh).
    measures the real symptom: what DNS server is actually being handed out
    to clients, regardless of what the router's admin UI claims. No browser,
    no login required for this path.
-2. **Remediator (on-demand, only runs when drift is detected)** — logs into
-   the router admin UI over plain HTTP (`POST /cgi-bin/te_acceso_router.cgi`,
-   plaintext password, cookie-based session), reads the CURRENT LAN
-   configuration from `/te_red_local.asp` (scraping a fresh `sessionKey` and
-   every other LAN field so they're preserved), and issues a single `GET
-   /cgi-bin/te_red_local.cgi` that changes ONLY the DNS. No browser needed —
-   the router's own "Aplicar cambios" button does a plain `location = <url>`
-   GET, not an XHR/form submit, so this is fully scriptable with `net/http`.
+2. **Remediator (on-demand, only runs when drift is detected)** — drives a
+   real Chrome/Chromium browser via
+   [chromedp](https://github.com/chromedp/chromedp): navigates to the router
+   admin UI, logs in, navigates to `/te_red_local.asp`, and updates the
+   `DNSserver1`/`DNSserver2` fields before clicking "Aplicar cambios".
 
 Every check cycle appends a structured event (`ok` | `drift` | `restore` |
 `error`) to an append-only JSONL log, and an ntfy notification is sent
 whenever drift is detected and (attempted to be) restored.
 
+## Why a real browser (not raw HTTP)
+
+An earlier version of this watchdog scripted the router's login purely over
+`net/http` (plaintext POST, cookie jar, browser-like headers, the exact form
+fields observed in the router's own JS). That was confirmed, exhaustively,
+to NOT work against this router: the POST returns 200, but a subsequent GET
+of `/te_red_local.asp` still returns the login page — the session never
+actually authenticates. Replaying the identical request as an XHR from
+inside a real browser fails the same way. Only a genuine top-level browser
+navigation with a native form submit (a real `.click()` on the login button)
+authenticates. This appears to be a real quirk/bug of this router family,
+not a bug in the request construction.
+
+Because of that, `internal/remediator` now drives an actual browser via
+chromedp instead of raw HTTP. This is slower and heavier (needs a real
+Chrome/Chromium binary — see Deploying below) but it is the only approach
+confirmed to work.
+
 ## Status: implemented, behind a DRY_RUN safety gate
 
-The full login + read + build + save + logout flow is implemented in
-`internal/remediator` and cross-platform tested (macOS + Linux) against a
-fake HTTP server — see Testing below. It has **not yet been exercised
-against the real router**, so two things matter before ever pointing this at
-production:
+The login + read + set DNS + apply flow is implemented in
+`internal/remediator` via chromedp. Because it depends on an actual browser
+authenticating against the real router's JS/DOM, it is **not** covered by
+fake-server unit tests the way the old HTTP flow was — it needs to be
+verified live (see `cmd/verify` below) with `DRY_RUN=true` before ever
+setting `DRY_RUN=false`.
 
-- **`DRY_RUN=true` is the default.** In dry-run mode, `Restore` logs in,
-  reads the LAN page, and builds the save URL, then **logs it** (with
-  `sessionKey` and any password redacted) and returns WITHOUT sending the
-  request that would change the router's config. Run the watchdog in
-  dry-run first, trigger a drift (or just watch the periodic log lines),
-  and manually verify the logged URL looks correct before setting
-  `DRY_RUN=false`.
-- **Plaintext password over LAN HTTP.** The router's login endpoint accepts
-  the password in plain text (confirmed — no md5/sha/base64 hashing). This
-  is inherent to the router, not something this watchdog can change; it's
-  only acceptable because the request never leaves the LAN. Treat
+- **`DRY_RUN=true` is the default.** In dry-run mode, `Restore` logs in via
+  the browser, navigates to the LAN page, and reads the current
+  `DNSserver1`/`DNSserver2` values, then **logs** what it found and what it
+  WOULD set — WITHOUT touching those fields or clicking "Aplicar cambios".
+  Run the watchdog in dry-run first, trigger a drift (or just watch the
+  periodic log lines), and confirm the logged values look correct before
+  setting `DRY_RUN=false`.
+- **Plaintext password.** The router's login form takes the password in
+  plain text (confirmed — no client-side hashing). This is inherent to the
+  router, not something this watchdog can change; it's only acceptable
+  because the browser only ever talks to the router over the LAN. Treat
   `ROUTER_PASSWORD` as a secret everywhere else (env vars, logs, Coolify
-  secrets) regardless.
-
-### Open assumptions — need live verification
-
-These are documented in code (see doc comments on `encodeLanHostDns` and
-`buildLANFieldsForRestore` in `internal/remediator`) and must be confirmed
-against a `DRY_RUN=true` log line before flipping `DRY_RUN=false`:
-
-1. **`lanHostDns` encoding** — hypothesis: a single comma-joined value,
-   `lanHostDns=<dns1>,<dns2>` (both set to `DESIRED_DNS`). The alternative —
-   a repeated `lanHostDns=` query parameter, one per server — has not been
-   ruled out. Isolated in `encodeLanHostDns()` so only that function needs
-   to change if wrong.
-2. **`lanHostDhcp`** — no confirmed source field on `te_red_local.asp`.
-   Currently mirrors `DHCPActive`'s current value as a best-effort guess.
-   If wrong, a save request could unintentionally toggle the DHCP server.
-3. **`loginSupport`** — expected value on the save call is unknown.
-   Currently defaults to an empty string.
+  secrets) regardless — and note the password is never written to any log
+  line produced by this package, even with `DEBUG_LOGIN=1`.
 
 ## Configuration
 
@@ -81,6 +81,9 @@ All configuration is via environment variables (see `env.example`):
 | `EVENT_LOG_PATH` | `/data/events.jsonl` | no | Append-only JSONL event log |
 | `IFACE` | auto-detected | no | Network interface for the DHCP probe |
 | `DRY_RUN` | `true` | no | Safety gate — see "Status" above. Set to `false` only after verifying a dry-run log line |
+| `CHROME_PATH` | auto-detected | no | Path to a Chrome/Chromium binary, if chromedp can't find one automatically |
+| `HEADFUL` | `""` (headless) | no | Set to `1` to run the browser with a visible window, for local debugging |
+| `DEBUG_LOGIN` | `""` (off) | no | Set to any non-empty value for verbose remediator step logging (never logs the password) |
 
 > Note: due to sandbox restrictions in the environment that generated this
 > scaffold, the example file is committed as `env.example` instead of the
@@ -104,6 +107,42 @@ The active DHCP probe (`internal/detector.Probe`) only builds on `linux`
 all the deterministic, unit-tested logic — still builds and tests cleanly
 everywhere.
 
+`go build ./...` and `go test ./...` do NOT need a browser installed —
+`internal/remediator`'s chromedp-driven code compiles and is exercised only
+at runtime (`go vet`/`go build` type-check it like any other Go code; there
+are no unit tests that actually launch a browser). To actually exercise the
+remediation flow, see `cmd/verify` below, which does need a real Chrome or
+Chromium on the machine running it.
+
+### Live-verifying the remediation flow (`cmd/verify`)
+
+`cmd/verify` drives the real browser flow against the real router, in
+FORCED `DRY_RUN` mode — it can read the current DNS values but can never
+change them. Run it from your own terminal so the router password never
+leaves your shell:
+
+```sh
+ROUTER_PASSWORD='your-router-password' go run ./cmd/verify
+```
+
+Useful variations:
+
+```sh
+# Watch the browser window while it runs, for debugging:
+HEADFUL=1 ROUTER_PASSWORD='...' go run ./cmd/verify
+
+# Verbose step-by-step logging (never logs the password):
+DEBUG_LOGIN=1 ROUTER_PASSWORD='...' go run ./cmd/verify
+
+# Point at a specific Chrome/Chromium binary if auto-detection fails:
+CHROME_PATH=/path/to/chrome ROUTER_PASSWORD='...' go run ./cmd/verify
+```
+
+A successful run logs the current `DNSserver1`/`DNSserver2` values read from
+the router. If you don't have `DESIRED_DNS`/`NTFY_URL` set already,
+`config.Load` still requires `DESIRED_DNS`; `cmd/verify` supplies a
+harmless placeholder `NTFY_URL` automatically.
+
 ## Deploying on Coolify
 
 Build and run via the provided `Dockerfile` / `docker-compose.yml`:
@@ -120,11 +159,19 @@ Two things are **required** for the DHCP probe to work in production:
 - `cap_add: [NET_RAW]` — the probe opens a raw socket to send/receive DHCP
   packets.
 
-The final image is built from `gcr.io/distroless/static-debian12` (root
-user, not the `:nonroot` variant) — deliberately, because Linux capability
-propagation to a non-root UID via `cap_add` is not guaranteed across all
-container runtimes, while a root-UID process reliably receives exactly the
-capability set Docker grants it (here, only `NET_RAW`).
+The final image is built from `debian:bookworm-slim` with `chromium`
+installed — **not** a distroless/static image anymore. The remediator drives
+a real browser via chromedp (see "Why a real browser" above), so the image
+must include one; this is a deliberate size-for-correctness tradeoff (the
+image grows by a few hundred MB). The browser only actually launches for the
+few seconds a remediation takes (i.e. only when drift is detected), so the
+extra size doesn't cost extra runtime resources most of the time.
+
+The image also still runs as root (not a `nonroot` user) — deliberately,
+because Linux capability propagation to a non-root UID via `cap_add` is not
+guaranteed across all container runtimes, while a root-UID process reliably
+receives exactly the capability set Docker grants it (here, only
+`NET_RAW`).
 
 In Coolify: deploy from this repo, set the service's Docker Compose method
 (or equivalent host-network + capability settings if using the App/Docker
@@ -132,30 +179,23 @@ Image deployment type), and set `ROUTER_PASSWORD` as a secret.
 
 ## Testing
 
-- Runner: `go test ./...` (cross-platform — macOS and Linux both fully
-  exercise `internal/remediator`; only `internal/detector`'s real `Probe`
-  is Linux-only, see above).
+- Runner: `go test ./...` (cross-platform — macOS and Linux; only
+  `internal/detector`'s real `Probe` is Linux-only, see above).
 - Unit-tested (pure, deterministic logic): DHCP option-6 parsing
   (`ParseDNSServers`), DNS drift comparison (`HasDrifted`), DNS list
   dedup (`DedupIPs`), network interface selection (`PickInterface`), config
   loading/validation, event log appends (using `t.TempDir()`), and the ntfy
   notifier (using `httptest.Server`).
-- `internal/remediator` (split by responsibility across
-  `saveurl.go`/`lanfields.go`/`session.go`/`remediator.go`), fully unit- and
-  integration-tested against a fake HTTP server (`httptest.Server`), no
-  real router needed:
-  - `BuildSaveURL`, `encodeLanHostDns`, `ScrapeSessionKey`, `redactURL`
-    (`saveurl_test.go`)
-  - `ParseLANFields`, `buildLANFieldsForRestore` (`lanfields_test.go`)
-  - `Login` — success, rejected credentials, missing session cookie
-    (`session_test.go`)
-  - `Restore` end-to-end — dry-run does NOT hit the save endpoint but does
-    log in/read/logout; a real run does hit the save endpoint; login
-    failure and missing-LAN-fields errors propagate correctly
-    (`remediator_test.go`, using the shared `fakeRouter` test double in
-    `fakerouter_test.go`)
-- NOT unit-tested (needs the real router/LAN): the active DHCP probe
-  (`Probe`, linux-only) and whether the three open assumptions above
-  (`lanHostDns` encoding, `lanHostDhcp`, `loginSupport`) are actually
-  correct — verify those with `DRY_RUN=true` against the real router before
-  ever setting `DRY_RUN=false`.
+- `internal/remediator` has NO unit tests of the browser-driven flow itself:
+  it depends on a real Chrome/Chromium binary launching and interacting with
+  the real router's live JS/DOM (frame layout, exact field names, submit
+  button behavior), none of which is meaningfully fakeable in a fast,
+  deterministic unit test — a fake HTML page can't reproduce "does a real
+  browser's native form submit authenticate against this specific router".
+  `go build ./...` / `go vet ./...` still fully type-check the package. It
+  is instead verified live via `cmd/verify` (see above), in forced
+  `DRY_RUN` mode.
+- NOT unit-tested (needs the real router/LAN, or a real Linux host):
+  the active DHCP probe (`Probe`, linux-only) and the entire browser-driven
+  remediation flow (login, LAN page navigation, reading/setting DNS fields)
+  — verify both live with `DRY_RUN=true` before ever setting `DRY_RUN=false`.

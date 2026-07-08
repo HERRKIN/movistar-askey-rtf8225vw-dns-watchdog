@@ -3,11 +3,51 @@
 package config
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
+
+// loadDotEnv best-effort loads KEY=VALUE lines from local env files into the
+// process environment (without overriding variables already set). It is a
+// local-development convenience; in production (e.g. Coolify) these files are
+// absent and real environment variables take precedence.
+//
+// It reads ".env" (standard) and "watchdog.secrets" (an alternate name used
+// for local testing in environments where .env access is restricted).
+func loadDotEnv() {
+	for _, name := range []string{".env", "watchdog.secrets"} {
+		loadEnvFile(name)
+	}
+}
+
+func loadEnvFile(name string) {
+	f, err := os.Open(name)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		val = strings.Trim(strings.TrimSpace(val), `"'`)
+		if _, exists := os.LookupEnv(key); !exists {
+			_ = os.Setenv(key, val)
+		}
+	}
+}
 
 // Config holds all runtime settings for the watchdog.
 type Config struct {
@@ -48,6 +88,8 @@ const (
 // Load reads configuration from environment variables, applies defaults for
 // optional fields, and validates required fields.
 func Load() (Config, error) {
+	loadDotEnv()
+
 	cfg := Config{
 		RouterURL:      getEnv("ROUTER_URL", defaultRouterURL),
 		RouterPassword: os.Getenv("ROUTER_PASSWORD"),

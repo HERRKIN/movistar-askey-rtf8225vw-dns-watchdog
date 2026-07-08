@@ -2,6 +2,7 @@
 .env
 .env.*
 !env.example
+watchdog.secrets
 
 # Runtime data (event log volume mount target for local runs)
 /data/
@@ -19,3 +20,4 @@ openspec/
 # Stray compiled command binaries
 /verify
 /cmd/**/verify
+/sshprobe
