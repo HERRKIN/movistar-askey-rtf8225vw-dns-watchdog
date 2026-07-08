@@ -1,0 +1,21 @@
+# Secrets / local config
+.env
+.env.*
+!env.example
+
+# Runtime data (event log volume mount target for local runs)
+/data/
+
+# Build artifacts
+/dns-modem-watchdog
+*.exe
+*.test
+*.out
+
+# Internal planning / tooling (not for the published repo)
+openspec/
+.atl/
+
+# Stray compiled command binaries
+/verify
+/cmd/**/verify
