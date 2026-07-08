@@ -31,3 +31,6 @@ nightwatch.sh
 daywatch.bin
 daywatch.log
 events.jsonl
+
+# Measurement-only
+Dockerfile.measure

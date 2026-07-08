@@ -37,6 +37,19 @@ func newBrowserContext(parent context.Context) (context.Context, context.CancelF
 	// the sandbox here is a deliberate, scoped tradeoff for that reason.
 	opts = append(opts, chromedp.NoSandbox)
 
+	// Flags required to start Chromium reliably inside a container:
+	//   - disable-dev-shm-usage: containers give /dev/shm only 64MB by
+	//     default, which makes Chromium crash on startup ("chrome failed to
+	//     start"); this uses /tmp instead.
+	//   - disable-gpu / disable-setuid-sandbox: no GPU or setuid helper in a
+	//     headless container.
+	// They are harmless for local (headful) debugging too.
+	opts = append(opts,
+		chromedp.Flag("disable-dev-shm-usage", true),
+		chromedp.Flag("disable-gpu", true),
+		chromedp.Flag("disable-setuid-sandbox", true),
+	)
+
 	if headful() {
 		opts = append(opts, chromedp.Flag("headless", false))
 	}
