@@ -21,3 +21,8 @@ openspec/
 /verify
 /cmd/**/verify
 /sshprobe
+
+# Overnight observer artifacts
+nightwatch.bin
+nightwatch.log
+nightwatch.sh
