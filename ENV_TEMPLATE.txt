@@ -1,0 +1,27 @@
+# Environment variables for dns-modem-watchdog
+#
+# For local development: copy this to .env and fill in your values
+# For Coolify: set these as environment variables in the service configuration
+#
+# KEEP YOUR .env FILE GITIGNORED — it contains secrets
+
+# Router credentials & URL
+ROUTER_URL=http://192.168.1.1
+ROUTER_PASSWORD=your_router_admin_password
+
+# Desired DNS server (your Pi-hole or other local DNS)
+DESIRED_DNS=192.168.1.254
+
+# ntfy.sh notifications (or your self-hosted ntfy)
+NTFY_URL=https://your-ntfy-server.com
+NTFY_TOPIC=your-topic
+NTFY_TOKEN=your_ntfy_bearer_token
+
+# Watchdog behavior
+DRY_RUN=false
+CHECK_INTERVAL=10m
+DEBUG=0
+EVENT_LOG_PATH=/data/events.jsonl
+
+# Timezone (optional, default: America/Santiago)
+TZ=America/Santiago

@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  dns-watchdog:
+    # For production (Coolify): pull from Docker Hub
+    image: herrkin/dns-modem-watchdog:latest
+    # For local dev: build from Dockerfile
+    # build: .
+    # image: dns-modem-watchdog:latest
+
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_RAW
+    shm_size: 1g
+    volumes:
+      - dns-watchdog-data:/data
+    env_file:
+      - .env
+
+volumes:
+  dns-watchdog-data:
